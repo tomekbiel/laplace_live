@@ -1,0 +1,23 @@
+{
+  "metrics": {
+    "total_trades": 4480,
+    "total_return": 14541.967962465435,
+    "sharpe_ratio": 13.003582431751376,
+    "max_drawdown": 772.7467156712589,
+    "win_rate": 83.01339285714285,
+    "profit_factor": 8.457407470795927,
+    "avg_return": 16.229874958108745,
+    "avg_duration": 17.261160714285715,
+    "long_trades": 2189,
+    "short_trades": 2291
+  },
+  "exit_reasons": {
+    "timeout_loss": 1585,
+    "trailing_stop": 1193,
+    "take_profit": 1126,
+    "reverse": 207,
+    "gap_close": 39,
+    "exit_z": 330
+  },
+  "finished": "2026-10-16T20:49:07"
+}

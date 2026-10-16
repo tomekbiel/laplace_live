@@ -1,0 +1,29 @@
+{
+  "model": "C:\\python\\intraday_activation_time_series_research\\results\\US.100+5\\dense128\\models\\relu_seed42.keras",
+  "model_parameters": "",
+  "cem_params": {
+    "entry_z": 2.0031202710577647,
+    "entry_timeout": 1.7221223286729592,
+    "trailing_activation": 1.2583771226292744,
+    "trailing_distance": 2.60633321069675,
+    "take_profit": 5.041846852767922,
+    "stop_loss": 3.5100274159225293,
+    "exit_z": 2.7256856595454924,
+    "reverse_sensitivity": 0.2882562628673535,
+    "max_hold": 99.20068451973756,
+    "time_decay": 0.002002954577284824,
+    "trend_filter": 3.5317621397167693,
+    "volatility_adapt": 0.7308524177404025,
+    "risk_multiplier": 1.121200047586921
+  },
+  "source": "C:\\python\\mt4_bridge\\data\\rates\\US.100+\\M5\\US.100+_M5.csv",
+  "windows": 61965,
+  "seed": 42,
+  "rules": {
+    "signed_exits": true,
+    "book_entry_bar": true
+  },
+  "started": "2026-10-16T20:49:58",
+  "mode": "backtest",
+  "git": "988000d"
+}

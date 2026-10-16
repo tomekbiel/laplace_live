@@ -1,0 +1,43 @@
+{
+  "model": "C:\\python\\intraday_activation_time_series_research\\results\\US.100+5\\dense128\\models\\relu_seed42.keras",
+  "model_parameters": "",
+  "experiment": {
+    "dataset": "US.100+5",
+    "architecture": "dense128",
+    "activation": "relu",
+    "seed": 42
+  },
+  "instrument": "US.100+",
+  "timeframe": "M5",
+  "cem_params": {
+    "entry_z": 2.0031202710577647,
+    "entry_timeout": 1.7221223286729592,
+    "trailing_activation": 1.2583771226292744,
+    "trailing_distance": 2.60633321069675,
+    "take_profit": 5.041846852767922,
+    "stop_loss": 3.5100274159225293,
+    "exit_z": 2.7256856595454924,
+    "reverse_sensitivity": 0.2882562628673535,
+    "max_hold": 99.20068451973756,
+    "time_decay": 0.002002954577284824,
+    "trend_filter": 3.5317621397167693,
+    "volatility_adapt": 0.7308524177404025,
+    "risk_multiplier": 1.121200047586921
+  },
+  "account": {
+    "number": 1123412008,
+    "balance": 405.69,
+    "equity": 405.69,
+    "leverage": 100,
+    "server_time": "2026-10-14 23:11:00"
+  },
+  "money": {
+    "enabled": false,
+    "risk_fraction": 0.0,
+    "fixed_lots": 0.01
+  },
+  "config_source": "C:\\python\\laplace_live\\config\\strategy.json",
+  "started": "2026-10-14T22:11:55",
+  "mode": "paper",
+  "git": "988000d"
+}

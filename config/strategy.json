@@ -1,0 +1,50 @@
+{
+  "_note": "Project root is C:/python/laplace_live and is taken from the file layout, never from here. experiment.results_root points at the RESEARCH repository, because that is where 5_train.py writes the models; nothing else in this project reads from there. Set it to whatever that repository is called on this machine.",
+  "experiment": {
+    "dataset": "US.100+5",
+    "architecture": "dense128",
+    "activation": "relu",
+    "seed": 42,
+    "model_path": null,
+    "results_root": "C:/python/intraday_activation_time_series_research/results"
+  },
+  "data": {
+    "bridge_root": "C:/python/mt4_bridge",
+    "symbol": "US.100+",
+    "timeframe": "M5",
+    "price_column": "close",
+    "gap_threshold_days": 7
+  },
+  "windows": {
+    "lookback": 20,
+    "predict_step": 1,
+    "rolling_window": 20,
+    "zscore_clip": 5.0
+  },
+  "strategy": {
+    "cem_params_path": "C:/python/intraday_activation_time_series_research/outputs/cem/cem_results_trend.npz",
+    "params": null
+  },
+  "rules": {
+    "signed_exits": false,
+    "book_entry_bar": true
+  },
+  "money": {
+    "enabled": false,
+    "risk_fraction": 0.0,
+    "fixed_lots": 0.01
+  },
+  "runtime": {
+    "bar_close_delay_sec": 8,
+    "fetch_bars": 400,
+    "request_timeout_sec": 60,
+    "max_retries": 3
+  },
+  "journal": {
+    "runs_dir": "runs"
+  },
+  "logging": {
+    "level": "INFO",
+    "to_file": true
+  }
+}

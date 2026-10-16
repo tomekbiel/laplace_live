@@ -1,0 +1,2 @@
+entry_time,exit_time,position,entry_step,exit_step,duration,return,return_pct,reason,entry_price,exit_price,lots,profit_currency
+2026-10-16 14:35:00,2026-10-16 14:40:00,-1,6,7,1,0.0012711810195469297,0.12711810195469297,timeout_loss,30075.83,30078.87,0.01,
