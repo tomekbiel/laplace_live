@@ -1,30 +1,34 @@
-"""
-Loading the trained model and turning its output into mu and b.
+"""Loading a trained model and turning its output into mu and b.
 
-Two things here are fixes rather than copies, and both are the difference
-between running and not running:
+A model file alone does not say what it was trained on, and that cost an
+evening: a network whose b was flat by design was traded for weeks because
+nothing recorded its feature set. So a model is loaded together with the
+card written beside it, and the pair — not the weights alone — is what the
+rest of the project consumes. The card carries the feature columns, the
+rolling window, the clipping and the intraday profile, so a caller builds
+windows the model can actually read instead of building them from a
+configuration that may have moved on.
 
-* 8_backtest.py passed only core.losses.CUSTOM_OBJECTS to load_model. A model
-  whose layers include BieLU_OU or BieLU_Laplace cannot be rebuilt from that
-  alone, so loading one raises. core.activations says in a comment that the
-  two dictionaries must be merged at load time; this does the merging.
-* The model path is composed the way 5_train.py writes it. 8_backtest.py
-  still pointed at models/saved/laplace_minimal.keras, the layout from before
-  runs were versioned.
+The second output of the network is a raw value, not a scale. Softplus and
+MIN_B are applied here so no caller has to remember.
 
-The second output of the network is a raw value, not a scale. Every consumer
-in the research code applies softplus and adds MIN_B before using it, and
-getting that wrong gives a plausible-looking number that is not b. It is done
-in one place here so no caller has to remember.
+Deseasonalisation lives here for the same reason. A model trained on
+y / s(minute) predicts b_norm, and the scale a trading rule needs is
+b_norm * s(minute). Keeping that multiplication in one place is what stops
+a backtest from running thresholds that mean one thing at 03:00 and
+another at the open.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
+from datetime import timedelta, timezone
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 
 from .core.activations import ACTIVATION_CUSTOM_OBJECTS
 from .core.losses import CUSTOM_OBJECTS, MIN_B
@@ -44,8 +48,7 @@ class Prediction:
         mu: Conditional median of the next log return. The model is trained
             with a Laplace likelihood, whose data term is an absolute
             deviation, so the estimator is the median.
-        b: Laplace scale. The tunnel mu +/- k*b covers 1 - exp(-k) of the
-            distribution.
+        b: Laplace scale, already seasonal where the model is deseasonalised.
     """
 
     mu: float
@@ -65,12 +68,9 @@ class Prediction:
             P_long  = P * exp( entry_z * b)
             P_short = P * exp(-entry_z * b)
 
-        This is the same inequality in price terms, nothing new. It is what
-        lets a decision be announced in advance.
-
         Args:
             price: Close of the bar the window ends on.
-            entry_z: The CEM entry threshold.
+            entry_z: The entry threshold, in units of b.
 
         Returns:
             (long trigger, short trigger).
@@ -81,8 +81,155 @@ class Prediction:
         )
 
 
+def read_card(path: Path) -> dict:
+    """The model's own record of how it was trained.
+
+    Returns an empty mapping for a model that predates cards; those were
+    all seven-feature, un-deseasonalised runs, and the defaults below match
+    that case.
+    """
+    card_path = path.with_suffix(".json")
+    if not card_path.is_file():
+        logger.warning("No card beside %s; assuming legacy settings", path.name)
+        return {}
+    return json.loads(card_path.read_text(encoding="utf-8"))
+
+
+def eastern_minutes(timestamps, broker_offset_hours: float) -> np.ndarray:
+    """Minute of day on the New York clock, from broker timestamps.
+
+    Broker stamps carry no zone and sit on a fixed offset from UTC, so they
+    are localised to that offset and then converted. Done on the raw stamps
+    rather than on an hour encoding, because this has to stay exact across
+    the daylight-saving boundary, where the same broker hour is the cash
+    open in one season and the macro slot in the other.
+    """
+    series = pd.Series(pd.to_datetime(np.atleast_1d(timestamps)))
+    offset = timezone(timedelta(hours=broker_offset_hours))
+    local = series.dt.tz_localize(offset).dt.tz_convert("America/New_York")
+    return (local.dt.hour * 60 + local.dt.minute).to_numpy()
+
+
+def seasonal_scale(card: dict, timestamps) -> np.ndarray:
+    """The multiplier this model's b has to be scaled by.
+
+    Interpolated across bucket centres rather than held as steps: the
+    profile is a smooth daily shape, and a step function puts cliffs into b
+    at bucket edges that no market event explains. Ones for a model that
+    was not deseasonalised, so every caller can multiply unconditionally.
+    """
+    length = len(np.atleast_1d(timestamps))
+    if not card.get("deseasonalised"):
+        return np.ones(length)
+
+    table = {int(k): float(v) for k, v in card["intraday_profile"].items()}
+    if not table:
+        return np.ones(length)
+
+    bucket_minutes = int(card.get("profile_bucket_minutes", 15))
+    minutes = eastern_minutes(timestamps, float(card.get("broker_utc_offset", 2.0)))
+
+    centres = np.array(sorted(table), dtype=float) + bucket_minutes / 2.0
+    values = np.array([table[int(c - bucket_minutes / 2.0)] for c in centres])
+
+    # Wrap at midnight so the interpolation closes the circle.
+    extended_x = np.concatenate(([centres[-1] - 1440.0], centres, [centres[0] + 1440.0]))
+    extended_y = np.concatenate(([values[-1]], values, [values[0]]))
+
+    return np.maximum(np.interp(minutes.astype(float), extended_x, extended_y), 1e-6)
+
+
+@dataclass
+class ScaledModel:
+    """A trained network together with everything needed to use it.
+
+    The window settings are read from the card rather than from the
+    configuration, so a model and the features it is fed cannot drift
+    apart. Pass these to windows.create_windows instead of the config
+    values.
+    """
+
+    model: object
+    card: dict
+    path: Path
+
+    @property
+    def feature_columns(self) -> tuple[str, ...]:
+        """The columns this model was trained on, in order."""
+        return tuple(self.card.get("features", ()))
+
+    @property
+    def rolling_window(self) -> int | None:
+        """Window for the robust statistics; None when the card is silent."""
+        value = self.card.get("rolling_window")
+        return int(value) if value is not None else None
+
+    @property
+    def lookback(self) -> int | None:
+        value = self.card.get("lookback")
+        return int(value) if value is not None else None
+
+    @property
+    def predict_step(self) -> int | None:
+        value = self.card.get("predict_step")
+        return int(value) if value is not None else None
+
+    @property
+    def zscore_clip(self) -> float:
+        """Infinity where the model was trained without clipping."""
+        value = self.card.get("zscore_clip")
+        return float("inf") if value is None else float(value)
+
+    @property
+    def input_shape(self):
+        return self.model.input_shape
+
+    def describe_parameters(self) -> str:
+        return describe_parameters(self.model)
+
+    def predict_batch(self, x: np.ndarray, timestamps=None):
+        """Predict for many windows at once, on the reconstructed scale.
+
+        Args:
+            x: Shape (n, lookback, n_features).
+            timestamps: One per window, for the seasonal multiplier. Only
+                optional for a model that was not deseasonalised; omitting
+                them for one that was raises, because silently returning
+                b_norm as b is the failure this class exists to prevent.
+
+        Returns:
+            (mu, b), both already seasonal.
+        """
+        mu, b = predict_batch(self.model, x)
+
+        if not self.card.get("deseasonalised"):
+            return mu, b
+
+        if timestamps is None:
+            raise ModelError(
+                f"{self.path.name} was trained deseasonalised, so b has to be "
+                f"multiplied by the intraday profile; pass the timestamps."
+            )
+
+        scale = seasonal_scale(self.card, timestamps)
+        if len(scale) != len(mu):
+            raise ModelError(
+                f"{len(timestamps)} timestamps for {len(mu)} windows."
+            )
+        return mu * scale, b * scale
+
+    def predict_one(self, x: np.ndarray, timestamp=None) -> Prediction:
+        """Predict for a single window of shape (lookback, n_features)."""
+        stamps = None if timestamp is None else [timestamp]
+        mu, b = self.predict_batch(x[np.newaxis, ...], stamps)
+        return Prediction(mu=float(mu[0]), b=float(b[0]))
+
+
 def load_model(path: Path):
     """Load a trained Keras model with every custom object it may need.
+
+    compile=False: inference needs neither the optimiser nor the loss, and
+    the loss function is not registered for deserialisation.
 
     Args:
         path: The .keras file.
@@ -98,12 +245,25 @@ def load_model(path: Path):
     custom = {**CUSTOM_OBJECTS, **ACTIVATION_CUSTOM_OBJECTS}
 
     try:
-        model = tf.keras.models.load_model(path, custom_objects=custom)
+        model = tf.keras.models.load_model(path, custom_objects=custom, compile=False)
     except Exception as exc:  # Keras raises a wide range of types here
         raise ModelError(f"Could not load {path}: {exc}") from exc
 
     logger.info("Loaded %s, input %s", path.name, model.input_shape)
     return model
+
+
+def load_scaled(path: Path) -> ScaledModel:
+    """Load a model together with its card. This is what callers want."""
+    card = read_card(path)
+    model = load_model(path)
+    if card:
+        logger.info(
+            "%s: features %s, rolling %s, clip %s, deseasonalised %s",
+            path.name, card.get("features"), card.get("rolling_window"),
+            card.get("zscore_clip"), card.get("deseasonalised"),
+        )
+    return ScaledModel(model=model, card=card, path=path)
 
 
 def describe_parameters(model) -> str:
@@ -125,14 +285,10 @@ def describe_parameters(model) -> str:
 
 
 def predict_batch(model, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Predict for many windows at once.
+    """Predict for many windows at once, without the seasonal multiplier.
 
-    Args:
-        model: A loaded model.
-        x: Shape (n, lookback, n_features).
-
-    Returns:
-        (mu, b) as arrays of length n, with b already passed through softplus.
+    Kept for callers that hold a bare Keras model. Anything that trades
+    should use ScaledModel instead.
 
     Raises:
         ModelError: The window shape does not match the model's input.
@@ -154,6 +310,6 @@ def predict_batch(model, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 def predict_one(model, x: np.ndarray) -> Prediction:
-    """Predict for a single window of shape (lookback, n_features)."""
+    """Predict for a single window, without the seasonal multiplier."""
     mu, b = predict_batch(model, x[np.newaxis, ...])
     return Prediction(mu=float(mu[0]), b=float(b[0]))

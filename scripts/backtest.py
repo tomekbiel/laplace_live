@@ -10,11 +10,19 @@ Two sources, because they answer different questions:
     --split <file>   the research project's *_split.npz. Reproduces the
                      original backtest's test set exactly, which is the only
                      way to check the figures against what was published.
+                     Those windows are seven-feature, so a model trained on
+                     a narrower set will refuse them, by design.
     (default)        the bridge's stored candles, through the same reader,
                      feature builder and window builder the live loop uses.
                      This is the honest rehearsal: if it disagrees with the
                      split run, the disagreement is in the data path and is
                      worth finding before any money moves.
+
+The windows are built from the MODEL'S CARD, not from the configuration:
+feature columns, rolling window, lookback and clipping all come from the
+file written beside the weights. A model and the features it is fed cannot
+then drift apart, which is how a network with a flat b was traded for weeks
+without anyone noticing.
 
 Metrics are computed the way calculate_metrics does in 8_backtest.py,
 including the leverage multiplication applied after the drawdown ratio is
@@ -23,8 +31,9 @@ ratio of equity, scaled afterwards, not a fraction of an account.
 
 Usage:
     python scripts/backtest.py
+    python scripts/backtest.py --model models/bielu_ou_seed42_level_deseason_noclip_r120.keras
+    python scripts/backtest.py --rule meanrev --no-entry-bar
     python scripts/backtest.py --split C:/.../US.100+5_split.npz
-    python scripts/backtest.py --out runs/backtest_reference
 """
 
 from __future__ import annotations
@@ -44,6 +53,8 @@ from laplace import reader, windows
 from laplace.config import load_config, setup_logging
 from laplace.journal import Journal
 from laplace.rules import Bar, Engine
+from laplace.strategy import ZScoreRule
+
 
 LEVERAGE = 20
 PERIODS_PER_DAY = 78
@@ -92,6 +103,25 @@ def metrics(trades, equity, leverage: int = LEVERAGE) -> dict:
     }
 
 
+def build_strategy(rule: str, params: dict, signed: bool):
+    """Pick the strategy, importing the optional one only when asked for.
+
+    MeanReversionRule may not be present in an older checkout, and a module
+    level import would then break a run that never wanted it.
+    """
+    if rule == "zscore":
+        return ZScoreRule(params=params, signed_exits=signed)
+
+    try:
+        from laplace.strategy import MeanReversionRule
+    except ImportError as exc:
+        raise SystemExit(
+            "laplace/strategy.py has no MeanReversionRule; add it before "
+            "running --rule meanrev."
+        ) from exc
+    return MeanReversionRule(params=params)
+
+
 def from_split(path: Path):
     """Load windows, targets and timestamps from a research split file."""
     data = np.load(path, allow_pickle=True)
@@ -102,27 +132,37 @@ def from_split(path: Path):
     return X, y, ts, mids
 
 
-def from_bridge(cfg, tail: int):
-    """Build the same arrays from the bridge's stored candles."""
+def from_bridge(cfg, tail: int, model: model_io.ScaledModel):
+    """Build the arrays from the bridge's stored candles, the model's way.
+
+    Every window setting is taken from the card where the card has one, so
+    a model trained on a 120-bar rolling window is never fed features built
+    on twenty.
+    """
     frame = reader.read_series(
         cfg.data.series_path, cfg.data.symbol, cfg.data.price_column, tail=tail
     )
     prepared = feature_builder.prepare(
         frame,
-        window_size=cfg.windows.rolling_window,
+        window_size=model.rolling_window or cfg.windows.rolling_window,
         gap_threshold_days=cfg.data.gap_threshold_days,
     )
     X, y, ts, mids, _, _ = windows.create_windows(
         prepared,
-        lookback=cfg.windows.lookback,
-        predict_step=cfg.windows.predict_step,
-        zscore_clip=cfg.windows.zscore_clip,
+        lookback=model.lookback or cfg.windows.lookback,
+        predict_step=model.predict_step or cfg.windows.predict_step,
+        feature_cols=model.feature_columns or None,
+        zscore_clip=model.zscore_clip,
     )
     return X, y, ts, mids
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run the rules over stored data.")
+    parser.add_argument("--model", default=None,
+                        help="a .keras file; the configured model when omitted")
+    parser.add_argument("--rule", choices=("zscore", "meanrev"), default="zscore",
+                        help="which strategy to run")
     parser.add_argument("--split", default=None,
                         help="a research *_split.npz, to reproduce the original figures")
     parser.add_argument("--tail", type=int, default=100000,
@@ -160,45 +200,70 @@ def main() -> int:
     np.random.seed(args.seed)
     params = cfg.strategy.load()
 
+    # The command line wins over the file; the engine is built from these
+    # two values, not from cfg, so a flag cannot be recorded in the label
+    # while the run quietly uses something else.
     signed = cfg.rules.signed_exits if args.signed_exits is None else args.signed_exits
     entry_bar = (cfg.rules.book_entry_bar if args.book_entry_bar is None
                  else args.book_entry_bar)
-    label = f"{'signed' if signed else 'orig'}-{'entrybar' if entry_bar else 'noentrybar'}"
-    model = model_io.load_model(cfg.experiment.resolved_model_path)
+
+    if args.rule == "meanrev":
+        label = f"meanrev-{'entrybar' if entry_bar else 'noentrybar'}"
+    else:
+        label = (f"{'signed' if signed else 'orig'}-"
+                 f"{'entrybar' if entry_bar else 'noentrybar'}")
+
+    # The card travels with the weights, so the windows below are built from
+    # what the model actually saw rather than from a config that may have
+    # moved on since it was trained.
+    model_path = (Path(args.model) if args.model
+                  else cfg.experiment.resolved_model_path)
+    model = model_io.load_scaled(model_path)
 
     if args.split:
         X, y, ts, mids = from_split(Path(args.split))
         source = args.split
     else:
-        X, y, ts, mids = from_bridge(cfg, args.tail)
+        X, y, ts, mids = from_bridge(cfg, args.tail, model)
         source = str(cfg.data.series_path)
 
     if len(X) == 0:
         print("No windows to run over.")
         return 1
 
+    print(f"model  : {model_path.name}")
     print(f"source : {source}")
-    print(f"exits  : {label}")
+    print(f"rule   : {args.rule}  ({label})")
     print(f"windows: {len(X)}  ({ts[0]} .. {ts[-1]})")
+    if model.feature_columns:
+        print(f"features: {list(model.feature_columns)}  "
+              f"rolling {model.rolling_window}  "
+              f"clip {'off' if model.zscore_clip == float('inf') else model.zscore_clip}")
 
-    mu, b = model_io.predict_batch(model, X)
+    # Timestamps go in because a deseasonalised model returns b_norm; the
+    # scale a rule can use is b_norm times the intraday profile.
+    mu, b = model.predict_batch(X, ts)
 
     engine = Engine(
-        params=params,
+        strategy=build_strategy(args.rule, params, signed),
         gap_threshold_min=2 * 5,
-        signed_exits=signed,
         book_entry_bar=entry_bar,
     )
-    journal = Journal(
-        cfg.journal.runs_dir, f"{cfg.experiment.run_name}_{label}", "backtest"
-    )
+    # Named after the model that was loaded, which --model may have picked
+    # over the configured one. A run directory that names a different model
+    # than the manifest is worse than a long directory name.
+    run_name = f"{cfg.experiment.dataset}_{model_path.stem}"
+    journal = Journal(cfg.journal.runs_dir, f"{run_name}_{label}", "backtest")
+
     journal.write_manifest({
-        "model": str(cfg.experiment.resolved_model_path),
-        "model_parameters": model_io.describe_parameters(model),
+        "model": str(model_path),
+        "model_card": model.card,
+        "model_parameters": model.describe_parameters(),
         "cem_params": params,
         "source": source,
         "windows": int(len(X)),
         "seed": args.seed,
+        "rule": args.rule,
         "rules": {"signed_exits": signed, "book_entry_bar": entry_bar},
     })
 

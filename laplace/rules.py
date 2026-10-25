@@ -1,5 +1,4 @@
-"""
-The entry and exit rules, as a state machine.
+"""Position state and the journal, driven by a pluggable strategy.
 
 simulate_trading in 8_backtest.py is one long function doing three jobs at
 once: walking an array, holding the position state, and applying the rules.
@@ -10,41 +9,18 @@ So the body of that loop lives here, fed one bar at a time, and the walking
 stays outside it. scripts/backtest.py drives it over stored data and
 laplace.live drives it over the socket, and both execute THE SAME rule code.
 
-Two switches, both off by default
----------------------------------
-Off, this reproduces 8_backtest.py exactly, including its defects, so the
-figures stay comparable with what was measured before. On, each repairs one
-family of defects. They are separate because their effects are separate and
-both need measuring against the same data.
+What is here and what is not
+----------------------------
+Here: the position, the trade journal, the equity curve, the time-gap and
+market-closed guards, and the undo for a close the broker refused. All of it
+is common to every strategy, so every strategy is measured the same way.
 
-**signed_exits** — the sign conventions.
+Not here: the decision. Whether to open and in which direction, and whether
+to close and for what reason, come from laplace.strategy. Adding a rule means
+adding a class there; this file does not change.
 
-7_cem.py and 8_backtest.py disagree about one variable. In the optimiser,
-current_z_score is the raw price move; in the backtest, cum_return already
-carries the position's sign. The exit conditions were copied from one to the
-other without adjusting for that, so every branch written for a short negates
-an already-signed quantity. Three consequences, all three observed live on
-2026-10-16:
-
-* The timeout branch tests `position * cum_return <= -stop_loss * b / 2`.
-  For a short that is `-|y_entry|`, and since entry requires
-  `|y_entry| > entry_z * b` while the threshold is `stop_loss * b / 2`, the
-  condition holds on the first managed bar whenever entry_z > stop_loss / 2.
-  Every short closed after exactly one bar — five out of five.
-* take_profit and stop_loss are swapped on the short side: a losing short
-  leaves as 'take_profit', a winning one as 'stop_loss'.
-* max_profit tracks `abs(cum_return)`, the absolute excursion rather than
-  the favourable one. A position deep in loss arms the trailing stop with
-  its own drawdown, and the stop then fires the moment the loss narrows —
-  which is exactly the "closed as it was turning positive" that both longs
-  did on 2026-10-16.
-
-On, cum_return is treated as signed throughout: a profit is positive for
-both directions, a loss negative, and max_profit records only favourable
-movement. Every branch then reads the same for a long and for a short.
-
-**book_entry_bar** — where the trade's return starts.
-
+book_entry_bar — where the trade's return starts
+------------------------------------------------
 On (the original), profit is summed from y[entry_step] inclusive: the bar
 whose move produced the signal. That bar closes before anyone knows a signal
 exists. Measured on the research test set, it was 97.8 per cent of everything
@@ -52,6 +28,10 @@ the backtest booked. 7_cem.py does NOT do this — it measures from the entry
 bar's close — so the parameters were optimised under one accounting and
 applied under another. Off, the trade starts at the entry bar's close, which
 is what a live run can actually capture.
+
+It stays an engine switch rather than a strategy one because it is
+accounting, not a decision: it changes what a trade is credited with, not
+what the rule asks for.
 """
 
 from __future__ import annotations
@@ -63,7 +43,8 @@ from typing import Any
 
 import numpy as np
 
-from .core.gaps import detect_time_gap, is_market_closed
+from .core.gaps import detect_time_gap, MARKET_CLOSED_COL_INDEX, is_market_closed
+from .strategy import EntryContext, ExitContext, Strategy
 
 logger = logging.getLogger(__name__)
 
@@ -121,19 +102,19 @@ class _Snapshot:
 
 @dataclass
 class Engine:
-    """Position state and the rules that change it.
+    """Position state, and the strategy that decides what changes it.
 
     Args:
-        params: The thirteen CEM parameters.
+        strategy: Supplies the entry and exit decisions. Everything about
+            position, journal, equity and the guards stays here.
         gap_threshold_min: Minutes above which a break force-closes the
             position and blocks entry.
-        signed_exits: Treat cum_return as signed in every exit branch.
         book_entry_bar: Include the triggering bar's return in the trade.
+            Accounting, not a decision, so it belongs to the engine.
     """
 
-    params: dict[str, float]
+    strategy: Strategy
     gap_threshold_min: float = 10.0
-    signed_exits: bool = False
     book_entry_bar: bool = True
 
     position: int = 0
@@ -150,6 +131,12 @@ class Engine:
     trades: list[dict[str, Any]] = field(default_factory=list)
     equity_curve: list[float] = field(default_factory=list)
 
+
+
+    @staticmethod
+    def _has_closed_column(window) -> bool:
+        """True when the window is wide enough to carry market_closed."""
+        return window.ndim == 2 and window.shape[1] > MARKET_CLOSED_COL_INDEX
     # ------------------------------------------------------------------
     # Public interface
     # ------------------------------------------------------------------
@@ -169,7 +156,11 @@ class Engine:
             self._prev_time = bar.time
             return self._force_close(result, bar, "gap_close")
 
-        if is_market_closed(bar.window):
+        # The column only exists when the model was trained on the full
+        # feature set. Narrower windows come out of create_windows already
+        # day-bounded, every bar inside a block of market_closed == 0, so
+        # there is nothing left for this guard to catch.
+        if self._has_closed_column(bar.window) and is_market_closed(bar.window):
             self._prev_time = bar.time
             return self._force_close(result, bar, "market_closed")
 
@@ -178,13 +169,18 @@ class Engine:
         current_b = bar.b
         result.signal_z = bar.y / current_b if current_b else 0.0
 
-        if self.params["volatility_adapt"]:
-            current_b = current_b * self.params["risk_multiplier"]
+        # Parameters are read through .get so a strategy that does not use
+        # a key simply leaves the engine's behaviour at its neutral value,
+        # instead of raising on a rule that was never meant to have it.
+        p = self.strategy.params
+        if p.get("volatility_adapt"):
+            current_b = current_b * p["risk_multiplier"]
 
         # Where the entry threshold sits in price terms, for anyone placing
         # the order by hand. Costs nothing and changes nothing.
-        result.long_trigger = bar.price * float(np.exp(self.params["entry_z"] * bar.b))
-        result.short_trigger = bar.price * float(np.exp(-self.params["entry_z"] * bar.b))
+        entry_z = p.get("entry_z", 0.0)
+        result.long_trigger = bar.price * float(np.exp(entry_z * bar.b))
+        result.short_trigger = bar.price * float(np.exp(-entry_z * bar.b))
 
         if self.position == 0:
             return self._maybe_open(result, bar)
@@ -252,15 +248,16 @@ class Engine:
         return result
 
     def _maybe_open(self, result: StepResult, bar: Bar) -> StepResult:
-        """Open when the signal clears the threshold.
+        """Open when the strategy asks for a direction.
 
         No equity point is recorded on a flat step, matching simulate_trading,
         where the flat branch appends nothing.
         """
-        if abs(result.signal_z) <= self.params["entry_z"]:
+        direction = self.strategy.entry(EntryContext(bar=bar, signal_z=result.signal_z))
+        if direction == 0:
             return result
 
-        self.position = int(np.sign(result.signal_z))
+        self.position = direction
         self.entry_time = bar.time
         self.entry_step = self.step
         self.entry_price = bar.price
@@ -278,30 +275,35 @@ class Engine:
         return result
 
     def _manage(self, result: StepResult, bar: Bar, current_b: float) -> StepResult:
-        """Apply the exit rules to an open position, in the original order."""
+        """Update position state, then ask the strategy whether to close."""
         self._returns.append(bar.y)
         cum_return = float(np.sum(self._returns)) * self.position
         current_z_score = cum_return / current_b if current_b else 0.0
 
         # Signed: only favourable movement counts, so a drawdown cannot arm
         # the trailing stop. Original: the absolute excursion, which can.
-        excursion = cum_return if self.signed_exits else abs(cum_return)
+        # The engine holds max_profit because it is position state, but the
+        # strategy says which convention its branches expect.
+        excursion = cum_return if self.strategy.signed_excursion else abs(cum_return)
         if excursion > self.max_profit:
             self.max_profit = excursion
 
         steps_in_pos = self.step - self.entry_step
 
-        if self.signed_exits:
-            exit_signal, exit_reason = self._exits_signed(
-                cum_return, current_z_score, current_b, steps_in_pos
+        exit_signal, exit_reason = self.strategy.exit(
+            ExitContext(
+                bar=bar,
+                position=self.position,
+                cum_return=cum_return,
+                current_z_score=current_z_score,
+                current_b=current_b,
+                steps_in_pos=steps_in_pos,
+                max_profit=self.max_profit,
             )
-        else:
-            exit_signal, exit_reason = self._exits_original(
-                cum_return, current_z_score, current_b, steps_in_pos
-            )
+        )
 
         if exit_signal and exit_reason == "max_hold":
-            cum_return -= self.params["time_decay"] * steps_in_pos
+            cum_return -= self.strategy.params["time_decay"] * steps_in_pos
 
         result.cum_return = cum_return
         result.position = self.position
@@ -317,96 +319,6 @@ class Engine:
 
         result.equity = self.equity
         return result
-
-    def _exits_signed(
-        self, cum_return: float, current_z_score: float,
-        current_b: float, steps_in_pos: int,
-    ) -> tuple[bool, str]:
-        """Exit rules with cum_return read as signed profit, both directions.
-
-        A profit is positive and a loss negative for a long and for a short
-        alike, so one branch serves both and the thresholds mean what their
-        names say.
-        """
-        p = self.params
-
-        # Timeout on an early loss. The original multiplies by position on
-        # top of an already-signed quantity, which made this fire on the
-        # first bar of every short.
-        if steps_in_pos <= p["entry_timeout"]:
-            if cum_return <= -p["stop_loss"] * current_b / 2:
-                return True, "timeout_loss"
-
-        # Trailing stop, armed only by favourable movement.
-        if p["trailing_activation"] > 0 and self.max_profit > p["trailing_activation"] * current_b:
-            if cum_return < self.max_profit - p["trailing_distance"] * current_b:
-                return True, "trailing_stop"
-
-        if cum_return > p["take_profit"] * current_b:
-            return True, "take_profit"
-
-        if cum_return < -p["stop_loss"] * current_b:
-            return True, "stop_loss"
-
-        # Give back to the tunnel, once the trade has earned enough.
-        if self.max_profit > p["trend_filter"] * current_b:
-            if abs(current_z_score) < p["exit_z"]:
-                return True, "exit_z"
-
-        # Reverse draw: the move has turned against the position.
-        if p["reverse_sensitivity"] > 0 and current_z_score < -0.5:
-            if np.random.random() < p["reverse_sensitivity"]:
-                return True, "reverse"
-
-        if steps_in_pos > p["max_hold"]:
-            return True, "max_hold"
-
-        return False, ""
-
-    def _exits_original(
-        self, cum_return: float, current_z_score: float,
-        current_b: float, steps_in_pos: int,
-    ) -> tuple[bool, str]:
-        """Exit rules transcribed from 8_backtest.py, defects included."""
-        p = self.params
-
-        if steps_in_pos <= p["entry_timeout"]:
-            if self.position * cum_return <= -p["stop_loss"] * current_b / 2:
-                return True, "timeout_loss"
-
-        if p["trailing_activation"] > 0 and self.max_profit > p["trailing_activation"] * current_b:
-            stop_z = self.max_profit - p["trailing_distance"] * current_b
-            if self.position == 1 and cum_return < stop_z:
-                return True, "trailing_stop"
-            if self.position == -1 and -cum_return < stop_z:
-                return True, "trailing_stop"
-
-        if self.position == 1 and cum_return > p["take_profit"] * current_b:
-            return True, "take_profit"
-        if self.position == -1 and -cum_return > p["take_profit"] * current_b:
-            return True, "take_profit"
-
-        if self.position == 1 and cum_return < -p["stop_loss"] * current_b:
-            return True, "stop_loss"
-        if self.position == -1 and -cum_return < -p["stop_loss"] * current_b:
-            return True, "stop_loss"
-
-        if self.max_profit > p["trend_filter"] * current_b:
-            if abs(current_z_score) < p["exit_z"]:
-                return True, "exit_z"
-
-        if p["reverse_sensitivity"] > 0:
-            if self.position == 1 and current_z_score < -0.5:
-                if np.random.random() < p["reverse_sensitivity"]:
-                    return True, "reverse"
-            if self.position == -1 and -current_z_score < -0.5:
-                if np.random.random() < p["reverse_sensitivity"]:
-                    return True, "reverse"
-
-        if steps_in_pos > p["max_hold"]:
-            return True, "max_hold"
-
-        return False, ""
 
     def _record(
         self, bar: Bar, cum_return: float, reason: str, exit_time: datetime | None,

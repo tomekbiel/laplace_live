@@ -1,10 +1,9 @@
-"""
-Split each trade into the part that could be traded and the part that could not.
+"""Split each trade into the part that could be traded and the part that could not.
 
-The backtest sums a position's return from y[entry_step] inclusive — the bar
-whose move produced the signal. That bar closes before anyone knows a signal
-exists, so its return is in the books but was never available. Everything
-after it is.
+With book_entry_bar on, the backtest sums a position's return from
+y[entry_step] inclusive — the bar whose move produced the signal. That bar
+closes before anyone knows a signal exists, so its return is in the books but
+was never available. Everything after it is.
 
 The split is exact, not estimated. At the entry bar the journal records
 
@@ -17,6 +16,12 @@ contribution to the trade is
 
 always positive, always the first term of the sum. Subtracting it leaves the
 return earned after the signal was visible.
+
+With book_entry_bar off, that term was never added, so there is nothing to
+remove: the trigger column reads zero and tradeable equals booked. The flag is
+read from the run's own manifest rather than assumed, because subtracting a
+term that was never added is how this tool once reported a trigger share of
+638983.9 per cent.
 
 What the answer means:
 
@@ -40,6 +45,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -72,6 +78,24 @@ def read_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def read_book_entry_bar(run: Path) -> bool:
+    """Whether this run booked the triggering bar, read from its manifest.
+
+    Without this the decomposition subtracts a trigger that was never added,
+    and a noentrybar run reports a meaningless tradeable column. Runs written
+    before the flag existed have no rules block, and those did book the entry
+    bar, so True is the right fallback.
+    """
+    path = run / "manifest.json"
+    if not path.is_file():
+        return True
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return True
+    return bool((manifest.get("rules") or {}).get("book_entry_bar", True))
+
+
 def build_entry_index(decisions: list[dict[str, str]]) -> dict[str, tuple[float, float]]:
     """Map entry bar time -> (signal_z, b) for every opening decision."""
     index: dict[str, tuple[float, float]] = {}
@@ -86,7 +110,9 @@ def build_entry_index(decisions: list[dict[str, str]]) -> dict[str, tuple[float,
 
 
 def split_trades(
-    trades: list[dict[str, str]], index: dict[str, tuple[float, float]]
+    trades: list[dict[str, str]],
+    index: dict[str, tuple[float, float]],
+    book_entry_bar: bool,
 ) -> tuple[list[Split], int]:
     """Decompose every trade whose entry bar can be found in the journal."""
     out: list[Split] = []
@@ -100,7 +126,8 @@ def split_trades(
 
         signal_z, b = index[key]
         booked = float(row["return"])
-        trigger = abs(signal_z) * b
+        # Nothing to remove when the run never booked the triggering bar.
+        trigger = abs(signal_z) * b if book_entry_bar else 0.0
 
         out.append(Split(
             reason=row.get("reason", ""),
@@ -173,10 +200,12 @@ def main() -> int:
         print("No trades in this run.")
         return 1
 
+    book_entry_bar = read_book_entry_bar(run)
     index = build_entry_index(decisions)
-    splits, unmatched = split_trades(trades, index)
+    splits, unmatched = split_trades(trades, index, book_entry_bar)
 
     print(f"run        : {run.name}")
+    print(f"entry bar  : {'booked' if book_entry_bar else 'not booked'}")
     print(f"trades     : {len(trades)}")
     print(f"decomposed : {len(splits)}")
     if unmatched:
@@ -187,6 +216,8 @@ def main() -> int:
 
     print(f"spread     : {args.spread_bp:.1f} bp per round turn")
     print("\nAll figures are basis points of log return, per trade.")
+    if not book_entry_bar:
+        print("This run did not book the triggering bar, so tradeable equals booked.")
 
     report("ALL TRADES", splits, args.spread_bp)
     report("LONGS", [s for s in splits if s.position == 1], args.spread_bp)
@@ -198,14 +229,12 @@ def main() -> int:
     tradeable = np.array([s.tradeable for s in splits]) * 10000
     net = tradeable.mean() - args.spread_bp
     print("\n" + "=" * 60)
+    print(f"  After the trigger bar and costs: {net:+.2f} bp per trade.")
     if net > 1.0:
-        print(f"  After the trigger bar and costs: {net:+.2f} bp per trade.")
         print("  The rule earns beyond the bar that produced the signal.")
     elif net > -1.0:
-        print(f"  After the trigger bar and costs: {net:+.2f} bp per trade.")
         print("  Too close to zero to call either way on this sample.")
     else:
-        print(f"  After the trigger bar and costs: {net:+.2f} bp per trade.")
         print("  What the backtest books comes from the triggering bar.")
     print("=" * 60)
     return 0

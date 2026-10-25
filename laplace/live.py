@@ -50,6 +50,7 @@ from .config import Config, add_bridge_to_path, load_instruments
 from .journal import Journal
 from .money import Instrument, PositionSizer
 from .rules import Bar, Engine
+from .strategy import ZScoreRule
 
 logger = logging.getLogger(__name__)
 
@@ -112,48 +113,52 @@ class LiveRunner:
     # Setup
     # ------------------------------------------------------------------
 
-    def _connect(self) -> None:
-        """Open the bridge and load everything that does not change."""
-        add_bridge_to_path(self._cfg)
+        def _connect(self):
+            """Open the bridge and load everything that does not change."""
+            add_bridge_to_path(self._cfg)
 
-        from mt4bridge.config import load_config as load_bridge_config
-        from mt4bridge.history import HistoryFetcher
-        from mt4bridge.trading import TradingClient
-        from mt4bridge.transport import Transport
+            from mt4bridge.config import load_config as load_bridge_config
+            from mt4bridge.history import HistoryFetcher
+            from mt4bridge.trading import TradingClient
+            from mt4bridge.transport import Transport
 
-        bridge_cfg = load_bridge_config(str(self._cfg.data.bridge_config_path))
-        self._transport = Transport(bridge_cfg, commands=True)
-        self._fetcher = HistoryFetcher(bridge_cfg, self._transport)
-        self._client = TradingClient(bridge_cfg, self._transport)
+            bridge_cfg = load_bridge_config(str(self._cfg.data.bridge_config_path))
+            self._transport = Transport(bridge_cfg, commands=True)
+            self._fetcher = HistoryFetcher(bridge_cfg, self._transport)
+            self._client = TradingClient(bridge_cfg, self._transport)
 
-        info = self._client.account_info()
-        if info.server_time is not None:
-            self._clock_offset = info.server_time - datetime.now()
-            logger.info("Broker clock runs %+.1f h from this machine",
-                        self._clock_offset.total_seconds() / 3600)
+            info = self._client.account_info()
+            if info.server_time is not None:
+                self._clock_offset = info.server_time - datetime.now()
+                logger.info("Broker clock runs %+.1f h from this machine",
+                            self._clock_offset.total_seconds() / 3600)
 
-        self._model = model_io.load_model(self._cfg.experiment.resolved_model_path)
+            self._model = model_io.load_model(self._cfg.experiment.resolved_model_path)
 
-        specs = load_instruments()
-        spec = specs.get(self._cfg.data.symbol)
-        if spec is None:
-            raise RuntimeError(
-                f"{self._cfg.data.symbol} has no entry in config/instruments.json"
+            specs = load_instruments()
+            spec = specs.get(self._cfg.data.symbol)
+            if spec is None:
+                raise RuntimeError(
+                    f"{self._cfg.data.symbol} has no entry in config/instruments.json"
+                )
+            instrument = Instrument.from_mapping(self._cfg.data.symbol, spec)
+            self._sizer = PositionSizer(
+                instrument,
+                enabled=self._cfg.money.enabled,
+                risk_fraction=self._cfg.money.risk_fraction,
+                fixed_lots=self._cfg.money.fixed_lots,
             )
-        instrument = Instrument.from_mapping(self._cfg.data.symbol, spec)
-        self._sizer = PositionSizer(
-            instrument,
-            enabled=self._cfg.money.enabled,
-            risk_fraction=self._cfg.money.risk_fraction,
-            fixed_lots=self._cfg.money.fixed_lots,
-        )
 
-        self._engine = Engine(
-            params=self._params,
-            gap_threshold_min=2 * self._step_minutes,
-            signed_exits=self._cfg.rules.signed_exits,
-            book_entry_bar=self._cfg.rules.book_entry_bar,
-        )
+            self._engine = Engine(
+                strategy=ZScoreRule(
+                    params=self._params,
+                    signed_exits=self._cfg.rules.signed_exits,
+                ),
+                gap_threshold_min=2 * self._step_minutes,
+                book_entry_bar=self._cfg.rules.book_entry_bar,
+            )
+
+            return info
 
         return info
 

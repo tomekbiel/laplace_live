@@ -65,7 +65,14 @@ class ExperimentConfig:
 
     @property
     def run_name(self) -> str:
-        """Identifier used for the run directory and the manifest."""
+        """Identifier used for the run directory and the manifest.
+
+        An explicit model_path wins over the composed fields, because a
+        directory named after dataset/architecture/activation would
+        otherwise describe a model that is not the one being run.
+        """
+        if self.model_path is not None:
+            return f"{self.dataset}_{self.model_path.stem}"
         return f"{self.dataset}_{self.architecture}_{self.activation}_seed{self.seed}"
 
     @property

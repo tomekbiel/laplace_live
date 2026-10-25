@@ -3,10 +3,10 @@
   "experiment": {
     "dataset": "US.100+5",
     "architecture": "dense128",
-    "activation": "relu",
+    "activation": "bielu_ou",
     "seed": 42,
-    "model_path": null,
-    "results_root": "C:/python/intraday_activation_time_series_research/results"
+    "results_root": "...",
+    "model_path": "models/bielu_ou_seed42_level_deseason_noclip_r120.keras"
   },
   "data": {
     "bridge_root": "C:/python/mt4_bridge",
