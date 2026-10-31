@@ -1,12 +1,13 @@
 {
-  "_note": "Contract specifications read from the MT4 terminal: Market Watch, right-click the symbol, Specification. Needed only once the money layer is switched on; until then the strategy trades fixed_lots and reports P&L in price units.",
+  "_note": "Contract specifications read from the MT4 terminal: Market Watch, right-click the symbol, Specification. tick_value_per_lot may be left null when the instrument is quoted in the account currency; it is then derived as contract_size * point. leverage is the account leverage for the instrument, e.g. 20 for a 5 percent margin requirement; when the Specification dialog does not show it, open a position and divide price * contract_size * lots by the margin the terminal reserved.",
 
   "US.100+": {
     "point": 0.01,
-    "contract_size": null,
-    "tick_value_per_lot": null,
+    "contract_size": 20,
+    "tick_value_per_lot": 0.20,
     "min_lot": 0.01,
     "lot_step": 0.01,
+    "leverage": 20,
     "currency": "USD"
   },
 
@@ -16,6 +17,7 @@
     "tick_value_per_lot": null,
     "min_lot": 0.01,
     "lot_step": 0.01,
+    "leverage": null,
     "currency": "USD"
   }
 }
